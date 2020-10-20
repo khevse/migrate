@@ -5,6 +5,7 @@ VERSION ?= $(shell git describe --tags 2>/dev/null | cut -c 2-)
 TEST_FLAGS ?=
 REPO_OWNER ?= $(shell cd .. && basename "$$(pwd)")
 COVERAGE_DIR ?= .coverage
+PROJECT ?= $(subst ${GOPATH}/src/,,$(shell pwd))
 
 build:
 	CGO_ENABLED=0 go build -ldflags='-X main.Version=$(VERSION)' -tags '$(DATABASE) $(SOURCE)' ./cmd/migrate
@@ -112,3 +113,15 @@ endef
 SHELL = /bin/sh
 RAND = $(shell echo $$RANDOM)
 
+.PHONY: lint
+lint:
+	docker run -it --rm \
+	-v "$(shell pwd):/go/src/${PROJECT}" \
+	-v "${GOPATH}/pkg:/go/pkg" \
+	-w "/go/src/${PROJECT}" \
+	golangci/golangci-lint:latest \
+	golangci-lint run ./... \
+	--color=always \
+	--concurrency=3 \
+	--timeout 3m \
+	-v
