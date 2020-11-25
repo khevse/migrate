@@ -3,20 +3,19 @@ package cassandra
 import (
 	"context"
 	"fmt"
-	"github.com/golang-migrate/migrate/v4"
+	"log"
 	"strconv"
 	"testing"
-)
+	"time"
 
-import (
 	"github.com/dhui/dktest"
 	"github.com/gocql/gocql"
-)
-
-import (
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	"github.com/golang-migrate/migrate/v4/dktesting"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -32,15 +31,78 @@ var (
 )
 
 func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
+
+	s, err := createSession(c)
+	if err != nil {
+		log.Println("is not ready: ", err)
+		return false
+	}
+	defer s.Close()
+
+	return true
+}
+
+func Test(t *testing.T) {
+	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+
+		for _, testcase := range []struct {
+			Name string
+			Func func(*testing.T, database.Driver, string)
+		}{
+			{Name: "base", Func: testBase},
+			{Name: "migrate", Func: testMigrate},
+		} {
+
+			func() {
+
+				keySpace := fmt.Sprintf("testks%d", time.Now().UnixNano())
+				{
+					// create test keyspace
+					s, err := createSession(c)
+					require.NoError(t, err)
+					defer s.Close()
+
+					query := fmt.Sprintf("CREATE KEYSPACE %s WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor':1}", keySpace)
+					err = s.Query(query).Exec()
+					require.NoError(t, err)
+					defer func() { s.Query("DROP KEYSPACE IF EXISTS " + keySpace).Exec() }()
+				}
+
+				ip, port, err := c.Port(9042)
+				require.NoError(t, err, "Unable to get mapped port")
+
+				addr := fmt.Sprintf("cassandra://%v:%v/"+keySpace, ip, port)
+				p := &Cassandra{}
+				d, err := p.Open(addr)
+				require.NoError(t, err)
+				defer func() { require.NoError(t, d.Close()) }()
+
+				t.Run(testcase.Name, func(*testing.T) { testcase.Func(t, d, keySpace) })
+			}()
+		}
+	})
+}
+
+func testBase(t *testing.T, d database.Driver, keySpace string) {
+	dt.Test(t, d, []byte("SELECT table_name from system_schema.tables"))
+}
+
+func testMigrate(t *testing.T, d database.Driver, keySpace string) {
+	m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", keySpace, d)
+	require.NoError(t, err)
+	dt.TestMigrate(t, m)
+}
+
+func createSession(c dktest.ContainerInfo) (*gocql.Session, error) {
 	// Cassandra exposes 5 ports (7000, 7001, 7199, 9042 & 9160)
 	// We only need the port bound to 9042
 	ip, portStr, err := c.Port(9042)
 	if err != nil {
-		return false
+		return nil, err
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return false
+		return nil, err
 	}
 
 	cluster := gocql.NewCluster(ip)
@@ -48,59 +110,8 @@ func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
 	cluster.Consistency = gocql.All
 	p, err := cluster.CreateSession()
 	if err != nil {
-		return false
+		return nil, err
 	}
-	defer p.Close()
-	// Create keyspace for tests
-	if err = p.Query("CREATE KEYSPACE testks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor':1}").Exec(); err != nil {
-		return false
-	}
-	return true
-}
 
-func Test(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.Port(9042)
-		if err != nil {
-			t.Fatal("Unable to get mapped port:", err)
-		}
-		addr := fmt.Sprintf("cassandra://%v:%v/testks", ip, port)
-		p := &Cassandra{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-		dt.Test(t, d, []byte("SELECT table_name from system_schema.tables"))
-	})
-}
-
-func TestMigrate(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.Port(9042)
-		if err != nil {
-			t.Fatal("Unable to get mapped port:", err)
-		}
-		addr := fmt.Sprintf("cassandra://%v:%v/testks", ip, port)
-		p := &Cassandra{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-
-		m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "testks", d)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dt.TestMigrate(t, m)
-	})
+	return p, nil
 }

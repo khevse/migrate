@@ -4,21 +4,22 @@ import (
 	"context"
 	"database/sql"
 	sqldriver "database/sql/driver"
+	"errors"
 	"fmt"
-	"log"
-
-	"github.com/golang-migrate/migrate/v4"
 	"io"
+	"log"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/dhui/dktest"
-
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	"github.com/golang-migrate/migrate/v4/dktesting"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
-
 	_ "github.com/nakagami/firebirdsql"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -49,29 +50,17 @@ func fbConnectionString(host, port string) string {
 }
 
 func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
-	ip, port, err := c.FirstPort()
+
+	db, err := createDbConnection(ctx, c)
 	if err != nil {
+		if !(errors.Is(err, sqldriver.ErrBadConn) || errors.Is(err, io.EOF)) {
+			log.Println("is not ready: ", err)
+		}
 		return false
 	}
 
-	db, err := sql.Open("firebirdsql", fbConnectionString(ip, port))
-	if err != nil {
-		log.Println("open error:", err)
-		return false
-	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			log.Println("close error:", err)
-		}
-	}()
-	if err = db.PingContext(ctx); err != nil {
-		switch err {
-		case sqldriver.ErrBadConn, io.EOF:
-			return false
-		default:
-			log.Println(err)
-		}
-		return false
+	if err := db.Close(); err != nil {
+		log.Println("close error:", err)
 	}
 
 	return true
@@ -79,148 +68,99 @@ func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
 
 func Test(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
 
-		addr := fbConnectionString(ip, port)
-		p := &Firebird{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
+		for _, testcase := range []struct {
+			Name string
+			Func func(_ *testing.T, _ database.Driver, addr, dbName string)
+		}{
+			{Name: "base", Func: testBase},
+			{Name: "lock", Func: testLock},
+			{Name: "migrate", Func: testMigrate},
+			{Name: "errorParsing", Func: testErrorParsing},
+			{Name: "filterCustomQuery", Func: testFilterCustomQuery},
+		} {
+
+			func() {
+				ip, port, err := c.FirstPort()
+				require.NoError(t, err, "Unable to get mapped port")
+
+				addr := fbConnectionString(ip, port)
+
+				p := &Firebird{}
+				d, err := p.Open(addr)
+				require.NoError(t, err)
+				defer func() { require.NoError(t, d.Close()) }()
+
+				t.Run(testcase.Name, func(*testing.T) { testcase.Func(t, d, addr, dbName) })
+			}()
 		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-		dt.Test(t, d, []byte("SELECT Count(*) FROM rdb$relations"))
 	})
 }
 
-func TestMigrate(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		addr := fbConnectionString(ip, port)
-		p := &Firebird{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-		m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "firebirdsql", d)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dt.TestMigrate(t, m)
-	})
+func testBase(t *testing.T, d database.Driver, addr, dbName string) {
+	dt.Test(t, d, []byte("SELECT Count(*) FROM rdb$relations"))
 }
 
-func TestErrorParsing(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
+func testMigrate(t *testing.T, d database.Driver, addr, dbName string) {
+	m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", dbName, d)
+	require.NoError(t, err)
+	dt.TestMigrate(t, m)
+}
 
-		addr := fbConnectionString(ip, port)
-		p := &Firebird{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
+func testErrorParsing(t *testing.T, d database.Driver, addr, dbName string) {
 
-		wantErr := `migration failed in line 0: CREATE TABLEE foo (foo varchar(40)); (details: Dynamic SQL Error
+	wantErr := `migration failed in line 0: CREATE TABLEE foo (foo varchar(40)); (details: Dynamic SQL Error
 SQL error code = -104
 Token unknown - line 1, column 8
 TABLEE
 )`
 
-		if err := d.Run(strings.NewReader("CREATE TABLEE foo (foo varchar(40));")); err == nil {
-			t.Fatal("expected err but got nil")
-		} else if err.Error() != wantErr {
-			msg := err.Error()
-			t.Fatalf("expected '%s' but got '%s'", wantErr, msg)
-		}
-	})
+	err := d.Run(strings.NewReader("CREATE TABLEE foo (foo varchar(40));"))
+	require.EqualError(t, err, wantErr)
 }
 
-func TestFilterCustomQuery(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
+func testFilterCustomQuery(t *testing.T, d database.Driver, addr, dbName string) {
 
-		addr := fbConnectionString(ip, port) + "?sslmode=disable&x-custom=foobar"
-		p := &Firebird{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-	})
+	u, err := url.Parse(addr)
+	require.NoError(t, err)
+
+	q := u.Query()
+	q.Set("x-custom", "foobar")
+	u.RawQuery = q.Encode()
+
+	c := &Firebird{}
+	_, err = c.Open(u.String())
+	require.NoError(t, err)
 }
 
-func Test_Lock(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
+func testLock(t *testing.T, d database.Driver, addr, dbName string) {
 
-		addr := fbConnectionString(ip, port)
-		p := &Firebird{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
+	dt.Test(t, d, []byte("SELECT Count(*) FROM rdb$relations"))
 
-		dt.Test(t, d, []byte("SELECT Count(*) FROM rdb$relations"))
+	ps := d.(*Firebird)
 
-		ps := d.(*Firebird)
+	require.NoError(t, ps.Lock())
+	require.NoError(t, ps.Unlock())
 
-		err = ps.Lock()
-		if err != nil {
-			t.Fatal(err)
-		}
+	require.NoError(t, ps.Lock())
+	require.NoError(t, ps.Unlock())
+}
 
-		err = ps.Unlock()
-		if err != nil {
-			t.Fatal(err)
-		}
+func createDbConnection(ctx context.Context, c dktest.ContainerInfo) (*sql.DB, error) {
 
-		err = ps.Lock()
-		if err != nil {
-			t.Fatal(err)
-		}
+	ip, port, err := c.FirstPort()
+	if err != nil {
+		return nil, fmt.Errorf("port error: %w", err)
+	}
 
-		err = ps.Unlock()
-		if err != nil {
-			t.Fatal(err)
-		}
-	})
+	db, err := sql.Open("firebirdsql", fbConnectionString(ip, port))
+	if err != nil {
+		return nil, fmt.Errorf("open error: %w", err)
+	}
+
+	if err = db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping error: %w", err)
+	}
+
+	return db, nil
 }

@@ -6,21 +6,20 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/golang-migrate/migrate/v4"
 	"log"
+	"net/url"
 	"strings"
 	"testing"
-)
+	"time"
 
-import (
 	"github.com/dhui/dktest"
-	_ "github.com/lib/pq"
-)
-
-import (
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	"github.com/golang-migrate/migrate/v4/dktesting"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	_ "github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
 
 const defaultPort = 26257
@@ -37,138 +36,118 @@ var (
 )
 
 func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
-	ip, port, err := c.Port(defaultPort)
+
+	db, err := createDbConnection(ctx, c)
 	if err != nil {
-		log.Println("port error:", err)
+		log.Println("is not ready: ", err)
 		return false
 	}
 
-	db, err := sql.Open("postgres", fmt.Sprintf("postgres://root@%v:%v?sslmode=disable", ip, port))
-	if err != nil {
-		log.Println("open error:", err)
-		return false
-	}
-	if err := db.PingContext(ctx); err != nil {
-		log.Println("ping error:", err)
-		return false
-	}
 	if err := db.Close(); err != nil {
 		log.Println("close error:", err)
 	}
+
 	return true
 }
 
-func createDB(t *testing.T, c dktest.ContainerInfo) {
+func Test(t *testing.T) {
+	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+
+		for _, testcase := range []struct {
+			Name string
+			Func func(_ *testing.T, _ database.Driver, addr, dbName string)
+		}{
+			{Name: "base", Func: testBase},
+			{Name: "migrate", Func: testMigrate},
+			{Name: "multiStatement", Func: testMultiStatement},
+			{Name: "filterCustomQuery", Func: testFilterCustomQuery},
+		} {
+
+			func() {
+
+				dbName := fmt.Sprintf("test%d", time.Now().UnixNano())
+				{
+					// create test database
+					db, err := createDbConnection(context.Background(), c)
+					require.NoError(t, err)
+					defer func() { require.NoError(t, db.Close()) }()
+
+					defer func() {
+						_, err = db.Exec("DROP DATABASE IF EXISTS " + dbName)
+						require.NoError(t, err)
+					}()
+
+					_, err = db.Exec("CREATE DATABASE " + dbName)
+					require.NoError(t, err)
+				}
+
+				ip, port, err := c.Port(defaultPort)
+				require.NoError(t, err, "Unable to get mapped port")
+
+				addr := fmt.Sprintf("cockroach://root@%v:%v/%s?sslmode=disable", ip, port, dbName)
+
+				c := &CockroachDb{}
+				d, err := c.Open(addr)
+				require.NoError(t, err)
+				defer func() { require.NoError(t, d.Close()) }()
+
+				t.Run(testcase.Name, func(*testing.T) { testcase.Func(t, d, addr, dbName) })
+			}()
+		}
+	})
+}
+
+func testBase(t *testing.T, d database.Driver, addr, dbName string) {
+	dt.Test(t, d, []byte("SELECT table_name from information_schema.tables"))
+}
+
+func testMigrate(t *testing.T, d database.Driver, addr, dbName string) {
+	m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", dbName, d)
+	require.NoError(t, err)
+	dt.TestMigrate(t, m)
+}
+
+func testMultiStatement(t *testing.T, d database.Driver, addr, dbName string) {
+
+	err := d.Run(strings.NewReader("CREATE TABLE foo (foo text); CREATE TABLE bar (bar text);"))
+	require.NoError(t, err)
+
+	// make sure second table exists
+	var exists bool
+	err = d.(*CockroachDb).db.QueryRow("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bar' AND table_schema = (SELECT current_schema()))").Scan(&exists)
+	require.NoError(t, err)
+	require.True(t, exists)
+}
+
+func testFilterCustomQuery(t *testing.T, d database.Driver, addr, dbName string) {
+
+	u, err := url.Parse(addr)
+	require.NoError(t, err)
+
+	q := u.Query()
+	q.Set("x-custom", "foobar")
+	u.RawQuery = q.Encode()
+
+	c := &CockroachDb{}
+	_, err = c.Open(u.String())
+	require.NoError(t, err)
+}
+
+func createDbConnection(ctx context.Context, c dktest.ContainerInfo) (*sql.DB, error) {
+
 	ip, port, err := c.Port(defaultPort)
 	if err != nil {
-		t.Fatal(err)
+		return nil, fmt.Errorf("port error: %w", err)
 	}
 
 	db, err := sql.Open("postgres", fmt.Sprintf("postgres://root@%v:%v?sslmode=disable", ip, port))
 	if err != nil {
-		t.Fatal(err)
+		return nil, fmt.Errorf("open error: %w", err)
 	}
-	if err = db.Ping(); err != nil {
-		t.Fatal(err)
+
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping error: %w", err)
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
 
-	if _, err = db.Exec("CREATE DATABASE migrate"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func Test(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, ci dktest.ContainerInfo) {
-		createDB(t, ci)
-
-		ip, port, err := ci.Port(26257)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		addr := fmt.Sprintf("cockroach://root@%v:%v/migrate?sslmode=disable", ip, port)
-		c := &CockroachDb{}
-		d, err := c.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dt.Test(t, d, []byte("SELECT 1"))
-	})
-}
-
-func TestMigrate(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, ci dktest.ContainerInfo) {
-		createDB(t, ci)
-
-		ip, port, err := ci.Port(26257)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		addr := fmt.Sprintf("cockroach://root@%v:%v/migrate?sslmode=disable", ip, port)
-		c := &CockroachDb{}
-		d, err := c.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "migrate", d)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dt.TestMigrate(t, m)
-	})
-}
-
-func TestMultiStatement(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, ci dktest.ContainerInfo) {
-		createDB(t, ci)
-
-		ip, port, err := ci.Port(26257)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		addr := fmt.Sprintf("cockroach://root@%v:%v/migrate?sslmode=disable", ip, port)
-		c := &CockroachDb{}
-		d, err := c.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := d.Run(strings.NewReader("CREATE TABLE foo (foo text); CREATE TABLE bar (bar text);")); err != nil {
-			t.Fatalf("expected err to be nil, got %v", err)
-		}
-
-		// make sure second table exists
-		var exists bool
-		if err := d.(*CockroachDb).db.QueryRow("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bar' AND table_schema = (SELECT current_schema()))").Scan(&exists); err != nil {
-			t.Fatal(err)
-		}
-		if !exists {
-			t.Fatalf("expected table bar to exist")
-		}
-	})
-}
-
-func TestFilterCustomQuery(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, ci dktest.ContainerInfo) {
-		createDB(t, ci)
-
-		ip, port, err := ci.Port(26257)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		addr := fmt.Sprintf("cockroach://root@%v:%v/migrate?sslmode=disable&x-custom=foobar", ip, port)
-		c := &CockroachDb{}
-		_, err = c.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-	})
+	return db, nil
 }

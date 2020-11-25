@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -17,19 +18,16 @@ import (
 	"os"
 	"strconv"
 	"testing"
-)
+	"time"
 
-import (
 	"github.com/dhui/dktest"
 	"github.com/go-sql-driver/mysql"
-	"github.com/stretchr/testify/assert"
-)
-
-import (
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	"github.com/golang-migrate/migrate/v4/dktesting"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/stretchr/testify/require"
 )
 
 const defaultPort = 3306
@@ -49,28 +47,17 @@ var (
 )
 
 func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
-	ip, port, err := c.Port(defaultPort)
+
+	db, err := createDbConnection(ctx, c)
 	if err != nil {
+		if !(errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, sqldriver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn)) {
+			log.Println("is not ready: ", err)
+		}
 		return false
 	}
 
-	db, err := sql.Open("mysql", fmt.Sprintf("root:root@tcp(%v:%v)/public", ip, port))
-	if err != nil {
-		return false
-	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			log.Println("close error:", err)
-		}
-	}()
-	if err = db.PingContext(ctx); err != nil {
-		switch err {
-		case sqldriver.ErrBadConn, mysql.ErrInvalidConn:
-			return false
-		default:
-			fmt.Println(err)
-		}
-		return false
+	if err := db.Close(); err != nil {
+		log.Println("close error:", err)
 	}
 
 	return true
@@ -80,160 +67,116 @@ func Test(t *testing.T) {
 	// mysql.SetLogger(mysql.Logger(log.New(ioutil.Discard, "", log.Ltime)))
 
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.Port(defaultPort)
-		if err != nil {
-			t.Fatal(err)
-		}
 
-		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public", ip, port)
-		p := &Mysql{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-		dt.Test(t, d, []byte("SELECT 1"))
+		for _, testcase := range []struct {
+			Name string
+			Func func(_ *testing.T, _ database.Driver, addr, dbName string)
+		}{
+			{Name: "base", Func: testBase},
+			{Name: "migrate", Func: testMigrate},
+			{Name: "lockWorks", Func: testLockWorks},
+			{Name: "noLockParamValidation", Func: testNoLockParamValidation},
+			{Name: "noLockWorks", Func: testNoLockWorks},
+		} {
 
-		// check ensureVersionTable
-		if err := d.(*Mysql).ensureVersionTable(); err != nil {
-			t.Fatal(err)
-		}
-		// check again
-		if err := d.(*Mysql).ensureVersionTable(); err != nil {
-			t.Fatal(err)
+			func() {
+
+				dbName := fmt.Sprintf("test%d", time.Now().UnixNano())
+				{
+					// create test database
+					db, err := createDbConnection(context.Background(), c)
+					require.NoError(t, err)
+					defer func() { require.NoError(t, db.Close()) }()
+
+					defer func() {
+						_, err = db.Exec("DROP DATABASE IF EXISTS " + dbName)
+						require.NoError(t, err)
+					}()
+
+					_, err = db.Exec("CREATE DATABASE " + dbName)
+					require.NoError(t, err)
+				}
+
+				ip, port, err := c.Port(defaultPort)
+				require.NoError(t, err, "Unable to get mapped port")
+
+				addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/%s", ip, port, dbName)
+
+				c := &Mysql{}
+				d, err := c.Open(addr)
+				require.NoError(t, err)
+				defer func() { require.NoError(t, d.Close()) }()
+
+				t.Run(testcase.Name, func(*testing.T) { testcase.Func(t, d, addr, dbName) })
+			}()
 		}
 	})
 }
 
-func TestMigrate(t *testing.T) {
+func testBase(t *testing.T, d database.Driver, addr, dbName string) {
+
+	dt.Test(t, d, []byte("SELECT 1"))
+
+	// check ensureVersionTable
+	require.NoError(t, d.(*Mysql).ensureVersionTable())
+	// check again
+	require.NoError(t, d.(*Mysql).ensureVersionTable())
+}
+
+func testMigrate(t *testing.T, d database.Driver, addr, dbName string) {
 	// mysql.SetLogger(mysql.Logger(log.New(ioutil.Discard, "", log.Ltime)))
 
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.Port(defaultPort)
-		if err != nil {
-			t.Fatal(err)
-		}
+	m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", dbName, d)
+	require.NoError(t, err)
+	dt.TestMigrate(t, m)
 
-		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public", ip, port)
-		p := &Mysql{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-
-		m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "public", d)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dt.TestMigrate(t, m)
-
-		// check ensureVersionTable
-		if err := d.(*Mysql).ensureVersionTable(); err != nil {
-			t.Fatal(err)
-		}
-		// check again
-		if err := d.(*Mysql).ensureVersionTable(); err != nil {
-			t.Fatal(err)
-		}
-	})
+	// check ensureVersionTable
+	require.NoError(t, d.(*Mysql).ensureVersionTable())
+	// check again
+	require.NoError(t, d.(*Mysql).ensureVersionTable())
 }
 
-func TestLockWorks(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.Port(defaultPort)
-		if err != nil {
-			t.Fatal(err)
-		}
+func testLockWorks(t *testing.T, d database.Driver, addr, dbName string) {
 
-		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public", ip, port)
-		p := &Mysql{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dt.Test(t, d, []byte("SELECT 1"))
+	dt.Test(t, d, []byte("SELECT 1"))
 
-		ms := d.(*Mysql)
+	ms := d.(*Mysql)
 
-		err = ms.Lock()
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = ms.Unlock()
-		if err != nil {
-			t.Fatal(err)
-		}
+	require.NoError(t, ms.Lock())
+	require.NoError(t, ms.Unlock())
 
-		// make sure the 2nd lock works (RELEASE_LOCK is very finicky)
-		err = ms.Lock()
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = ms.Unlock()
-		if err != nil {
-			t.Fatal(err)
-		}
-	})
+	// make sure the 2nd lock works (RELEASE_LOCK is very finicky)
+	require.NoError(t, ms.Lock())
+	require.NoError(t, ms.Unlock())
 }
 
-func TestNoLockParamValidation(t *testing.T) {
+func testNoLockParamValidation(t *testing.T, d database.Driver, addr, dbName string) {
+
 	ip := "127.0.0.1"
 	port := 3306
-	addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public", ip, port)
+	addr = fmt.Sprintf("mysql://root:root@tcp(%v:%v)/%s", ip, port, dbName)
 	p := &Mysql{}
 	_, err := p.Open(addr + "?x-no-lock=not-a-bool")
-	if !errors.Is(err, strconv.ErrSyntax) {
-		t.Fatal("Expected syntax error when passing a non-bool as x-no-lock parameter")
-	}
+	require.Truef(t,
+		errors.Is(err, strconv.ErrSyntax),
+		"Expected syntax error when passing a non-bool as x-no-lock parameter: %v", err)
 }
 
-func TestNoLockWorks(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.Port(defaultPort)
-		if err != nil {
-			t.Fatal(err)
-		}
+func testNoLockWorks(t *testing.T, d database.Driver, addr, dbName string) {
 
-		addr := fmt.Sprintf("mysql://root:root@tcp(%v:%v)/public", ip, port)
-		p := &Mysql{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
+	lock := d.(*Mysql)
 
-		lock := d.(*Mysql)
+	p := &Mysql{}
+	d, err := p.Open(addr + "?x-no-lock=true")
+	require.NoError(t, err)
 
-		p = &Mysql{}
-		d, err = p.Open(addr + "?x-no-lock=true")
-		if err != nil {
-			t.Fatal(err)
-		}
+	noLock := d.(*Mysql)
 
-		noLock := d.(*Mysql)
-
-		// Should be possible to take real lock and no-lock at the same time
-		if err = lock.Lock(); err != nil {
-			t.Fatal(err)
-		}
-		if err = noLock.Lock(); err != nil {
-			t.Fatal(err)
-		}
-		if err = lock.Unlock(); err != nil {
-			t.Fatal(err)
-		}
-		if err = noLock.Unlock(); err != nil {
-			t.Fatal(err)
-		}
-	})
+	// Should be possible to take real lock and no-lock at the same time
+	require.NoError(t, lock.Lock())
+	require.NoError(t, noLock.Lock())
+	require.NoError(t, lock.Unlock())
+	require.NoError(t, noLock.Unlock())
 }
 
 func TestExtractCustomQueryParams(t *testing.T) {
@@ -282,11 +225,11 @@ func TestExtractCustomQueryParams(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			customParams, err := extractCustomQueryParams(tc.config)
 			if tc.config != nil {
-				assert.Equal(t, tc.expectedParams, tc.config.Params,
+				require.Equal(t, tc.expectedParams, tc.config.Params,
 					"Expected config params have custom params properly removed")
 			}
-			assert.Equal(t, tc.expectedErr, err, "Expected errors to match")
-			assert.Equal(t, tc.expectedCustomParams, customParams,
+			require.Equal(t, tc.expectedErr, err, "Expected errors to match")
+			require.Equal(t, tc.expectedCustomParams, customParams,
 				"Expected custom params to be properly extracted")
 		})
 	}
@@ -294,33 +237,27 @@ func TestExtractCustomQueryParams(t *testing.T) {
 
 func createTmpCert(t *testing.T) string {
 	tmpCertFile, err := ioutil.TempFile("", "migrate_test_cert")
-	if err != nil {
-		t.Fatal("Failed to create temp cert file:", err)
-	}
+	require.NoError(t, err, "Failed to create temp cert file")
+
 	t.Cleanup(func() {
-		if err := os.Remove(tmpCertFile.Name()); err != nil {
-			t.Log("Failed to cleanup temp cert file:", err)
-		}
+		require.NoError(t, err, os.Remove(tmpCertFile.Name()), "Failed to cleanup temp cert file")
 	})
 
 	r := rand.New(rand.NewSource(0))
 	pub, priv, err := ed25519.GenerateKey(r)
-	if err != nil {
-		t.Fatal("Failed to generate ed25519 key for temp cert file:", err)
-	}
+	require.NoError(t, err, "Failed to generate ed25519 key for temp cert file")
+
 	tmpl := x509.Certificate{
 		SerialNumber: big.NewInt(0),
 	}
 	derBytes, err := x509.CreateCertificate(r, &tmpl, &tmpl, pub, priv)
-	if err != nil {
-		t.Fatal("Failed to generate temp cert file:", err)
-	}
-	if err := pem.Encode(tmpCertFile, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
-		t.Fatal("Failed to encode ")
-	}
-	if err := tmpCertFile.Close(); err != nil {
-		t.Fatal("Failed to close temp cert file:", err)
-	}
+	require.NoError(t, err, "Failed to generate temp cert file")
+
+	err = pem.Encode(tmpCertFile, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	require.NoError(t, err, "Failed to encode")
+
+	require.NoError(t, err, tmpCertFile.Close(), "Failed to close temp cert file")
+
 	return tmpCertFile.Name()
 }
 
@@ -365,13 +302,29 @@ func TestURLToMySQLConfig(t *testing.T) {
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
 			config, err := urlToMySQLConfig(tc.urlStr)
-			if err != nil {
-				t.Fatal("Failed to parse url string:", tc.urlStr, "error:", err)
-			}
+			require.NoError(t, err)
+
 			dsn := config.FormatDSN()
-			if dsn != tc.expectedDSN {
-				t.Error("Got unexpected DSN:", dsn, "!=", tc.expectedDSN)
-			}
+			require.Equal(t, tc.expectedDSN, dsn)
 		})
 	}
+}
+
+func createDbConnection(ctx context.Context, c dktest.ContainerInfo) (*sql.DB, error) {
+
+	ip, port, err := c.Port(defaultPort)
+	if err != nil {
+		return nil, fmt.Errorf("port error: %w", err)
+	}
+
+	db, err := sql.Open("mysql", fmt.Sprintf("root:root@tcp(%v:%v)/public", ip, port))
+	if err != nil {
+		return nil, fmt.Errorf("open error: %w", err)
+	}
+
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping error: %w", err)
+	}
+
+	return db, nil
 }

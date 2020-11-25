@@ -7,3 +7,5 @@ cli/migrate
 vendor/
 .vscode/
 .idea/
+*.out
+*.test

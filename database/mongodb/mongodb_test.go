@@ -3,29 +3,27 @@ package mongodb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-
-	"log"
-
-	"github.com/golang-migrate/migrate/v4"
 	"io"
+	"log"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"testing"
 	"time"
-)
 
-import (
 	"github.com/dhui/dktest"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-)
-
-import (
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
 	"github.com/golang-migrate/migrate/v4/dktesting"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var (
@@ -39,212 +37,132 @@ var (
 	}
 )
 
-func mongoConnectionString(host, port string) string {
+func mongoConnectionString(host, port, dbName string) string {
 	// there is connect option for excluding serverConnection algorithm
 	// it's let avoid errors with mongo replica set connection in docker container
-	return fmt.Sprintf("mongodb://%s:%s/testMigration?connect=direct", host, port)
+	return fmt.Sprintf("mongodb://%s:%s/%s?connect=direct", host, port, dbName)
 }
 
 func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
-	ip, port, err := c.FirstPort()
-	if err != nil {
-		return false
-	}
 
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoConnectionString(ip, port)))
+	db, err := createDbConnection(ctx, c)
 	if err != nil {
-		return false
-	}
-	defer func() {
-		if err := client.Disconnect(ctx); err != nil {
-			log.Println("close error:", err)
-		}
-	}()
-
-	if err = client.Ping(ctx, nil); err != nil {
-		switch err {
-		case io.EOF:
-			return false
-		default:
-			log.Println(err)
+		if !errors.Is(err, io.EOF) {
+			log.Println("is not ready: ", err)
 		}
 		return false
 	}
+
+	if err := db.Disconnect(ctx); err != nil {
+		log.Println("close error:", err)
+	}
+
 	return true
 }
 
 func Test(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
 
-		addr := mongoConnectionString(ip, port)
-		p := &Mongo{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-		dt.TestNilVersion(t, d)
-		dt.TestLockAndUnlock(t, d)
-		dt.TestRun(t, d, bytes.NewReader([]byte(`[{"insert":"hello","documents":[{"wild":"world"}]}]`)))
-		dt.TestSetVersion(t, d)
-		dt.TestDrop(t, d)
-	})
-}
-
-func TestMigrate(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		addr := mongoConnectionString(ip, port)
-		p := &Mongo{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-		m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "", d)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dt.TestMigrate(t, m)
-	})
-}
-
-func TestWithAuth(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		addr := mongoConnectionString(ip, port)
-		p := &Mongo{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-		createUserCMD := []byte(`[{"createUser":"deminem","pwd":"gogo","roles":[{"role":"readWrite","db":"testMigration"}]}]`)
-		err = d.Run(bytes.NewReader(createUserCMD))
-		if err != nil {
-			t.Fatal(err)
-		}
-		testcases := []struct {
-			name            string
-			connectUri      string
-			isErrorExpected bool
+		for _, testcase := range []struct {
+			Name string
+			Func func(_ *testing.T, _ database.Driver, addr, dbName string)
 		}{
-			{"right auth data", "mongodb://deminem:gogo@%s:%v/testMigration", false},
-			{"wrong auth data", "mongodb://wrong:auth@%s:%v/testMigration", true},
-		}
+			{Name: "base", Func: testBase},
+			{Name: "migrate", Func: testMigrate},
+			{Name: "withAuthRight", Func: testWithAuthRight},
+			{Name: "withAuthWrong", Func: testWithAuthWrong},
+			{Name: "lockWorks", Func: testLockWorks},
+		} {
 
-		for _, tcase := range testcases {
-			t.Run(tcase.name, func(t *testing.T) {
-				mc := &Mongo{}
-				d, err := mc.Open(fmt.Sprintf(tcase.connectUri, ip, port))
-				if err == nil {
-					defer func() {
-						if err := d.Close(); err != nil {
-							t.Error(err)
-						}
-					}()
-				}
+			func() {
 
-				switch {
-				case tcase.isErrorExpected && err == nil:
-					t.Fatalf("no error when expected")
-				case !tcase.isErrorExpected && err != nil:
-					t.Fatalf("unexpected error: %v", err)
-				}
-			})
+				dbName := fmt.Sprintf("test%d", time.Now().UnixNano())
+
+				ip, port, err := c.FirstPort()
+				require.NoError(t, err, "Unable to get mapped port")
+
+				addr := mongoConnectionString(ip, port, dbName)
+
+				c := &Mongo{}
+				d, err := c.Open(addr)
+				require.NoError(t, err)
+				defer func() { require.NoError(t, d.Close()) }()
+
+				t.Run(testcase.Name, func(*testing.T) { testcase.Func(t, d, addr, dbName) })
+			}()
 		}
 	})
 }
 
-func TestLockWorks(t *testing.T) {
-	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
+func testBase(t *testing.T, d database.Driver, addr, dbName string) {
 
-		addr := mongoConnectionString(ip, port)
-		p := &Mongo{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
+	dt.TestNilVersion(t, d)
+	dt.TestLockAndUnlock(t, d)
+	dt.TestRun(t, d, bytes.NewReader([]byte(`[{"insert":"hello","documents":[{"wild":"world"}]}]`)))
+	dt.TestSetVersion(t, d)
+	dt.TestDrop(t, d)
+}
 
-		dt.TestRun(t, d, bytes.NewReader([]byte(`[{"insert":"hello","documents":[{"wild":"world"}]}]`)))
+func testMigrate(t *testing.T, d database.Driver, addr, dbName string) {
 
-		mc := d.(*Mongo)
+	m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "", d)
+	require.NoError(t, err)
+	dt.TestMigrate(t, m)
+}
 
-		err = mc.Lock()
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = mc.Unlock()
-		if err != nil {
-			t.Fatal(err)
-		}
+func testWithAuthRight(t *testing.T, d database.Driver, addr, dbName string) {
 
-		err = mc.Lock()
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = mc.Unlock()
-		if err != nil {
-			t.Fatal(err)
-		}
+	createUserCMD := []byte(`[{"createUser":"deminem","pwd":"gogo","roles":[{"role":"readWrite","db":"testMigration"}]}]`)
+	err := d.Run(bytes.NewReader(createUserCMD))
+	require.NoError(t, err)
 
-		// disable locking, validate wer can lock twice
-		mc.config.Locking.Enabled = false
-		err = mc.Lock()
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = mc.Lock()
-		if err != nil {
-			t.Fatal(err)
-		}
+	u, err := url.Parse(addr)
+	require.NoError(t, err)
 
-		// re-enable locking,
-		//try to hit a lock conflict
-		mc.config.Locking.Enabled = true
-		mc.config.Locking.Timeout = 1
-		err = mc.Lock()
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = mc.Lock()
-		if err == nil {
-			t.Fatal("should have failed, mongo should be locked already")
-		}
-	})
+	u.User = url.UserPassword("deminem", "gogo")
+
+	mc := &Mongo{}
+	ld, err := mc.Open(u.String())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, ld.Close()) }()
+}
+
+func testWithAuthWrong(t *testing.T, d database.Driver, addr, dbName string) {
+
+	u, err := url.Parse(addr)
+	require.NoError(t, err)
+
+	u.User = url.UserPassword("wrong", "auth")
+
+	mc := &Mongo{}
+	ld, err := mc.Open(u.String())
+	require.NotNil(t, err)
+	require.Nil(t, ld)
+}
+
+func testLockWorks(t *testing.T, d database.Driver, addr, dbName string) {
+
+	dt.TestRun(t, d, bytes.NewReader([]byte(`[{"insert":"hello","documents":[{"wild":"world"}]}]`)))
+
+	mc := d.(*Mongo)
+
+	require.NoError(t, mc.Lock())
+	require.NoError(t, mc.Unlock())
+
+	require.NoError(t, mc.Lock())
+	require.NoError(t, mc.Unlock())
+
+	// disable locking, validate wer can lock twice
+	mc.config.Locking.Enabled = false
+	require.NoError(t, mc.Lock())
+	require.NoError(t, mc.Lock())
+
+	// re-enable locking,
+	//try to hit a lock conflict
+	mc.config.Locking.Enabled = true
+	mc.config.Locking.Timeout = 1
+	require.NoError(t, mc.Lock())
+	require.EqualError(t, mc.Lock(), "can't acquire lock")
 }
 
 func TestTransaction(t *testing.T) {
@@ -253,39 +171,25 @@ func TestTransaction(t *testing.T) {
 			Cmd: []string{"mongod", "--bind_ip_all", "--replSet", "rs0"}}},
 	}
 	dktesting.ParallelTest(t, transactionSpecs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
-		if err != nil {
-			t.Fatal(err)
-		}
 
-		client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(mongoConnectionString(ip, port)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = client.Ping(context.TODO(), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		client, err := createDbConnection(context.TODO(), c)
+		require.NoError(t, err)
+
 		//rs.initiate()
 		err = client.Database("admin").RunCommand(context.TODO(), bson.D{bson.E{Key: "replSetInitiate", Value: bson.D{}}}).Err()
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
+
 		err = waitForReplicaInit(client)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
+
+		dbName := fmt.Sprintf("test%d", time.Now().UnixNano())
+
 		d, err := WithInstance(client, &Config{
-			DatabaseName: "testMigration",
+			DatabaseName: dbName,
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
+		require.NoError(t, err)
+		defer func() { require.NoError(t, d.Close()) }()
+
 		//We have to create collection
 		//transactions don't support operations with creating new dbs, collections
 		//Unique index need for checking transaction aborting
@@ -302,9 +206,8 @@ func TestTransaction(t *testing.T) {
 					}]
 			}]`)
 		err = d.Run(bytes.NewReader(insertCMD))
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
+
 		testcases := []struct {
 			name            string
 			cmds            []byte
@@ -338,39 +241,28 @@ func TestTransaction(t *testing.T) {
 		}
 		for _, tcase := range testcases {
 			t.Run(tcase.name, func(t *testing.T) {
-				client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(mongoConnectionString(ip, port)))
-				if err != nil {
-					t.Fatal(err)
-				}
-				err = client.Ping(context.TODO(), nil)
-				if err != nil {
-					t.Fatal(err)
-				}
+
+				client, err := createDbConnection(context.Background(), c)
+				require.NoError(t, err)
+
 				d, err := WithInstance(client, &Config{
-					DatabaseName:    "testMigration",
+					DatabaseName:    dbName,
 					TransactionMode: true,
 				})
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer func() {
-					if err := d.Close(); err != nil {
-						t.Error(err)
-					}
-				}()
+				require.NoError(t, err)
+				defer func() { require.NoError(t, d.Close()) }()
+
 				runErr := d.Run(bytes.NewReader(tcase.cmds))
-				if runErr != nil {
-					if !tcase.isErrorExpected {
-						t.Fatal(runErr)
-					}
+				if tcase.isErrorExpected {
+					require.NotNil(t, runErr)
+				} else {
+					require.NoError(t, runErr)
 				}
-				documentsCount, err := client.Database("testMigration").Collection("hello").CountDocuments(context.TODO(), bson.M{})
-				if err != nil {
-					t.Fatal(err)
-				}
-				if tcase.documentsCount != documentsCount {
-					t.Fatalf("expected %d and actual %d documents count not equal. run migration error:%s", tcase.documentsCount, documentsCount, runErr)
-				}
+
+				documentsCount, err := client.Database(dbName).Collection("hello").CountDocuments(context.TODO(), bson.M{})
+				require.NoError(t, err)
+
+				require.Equal(t, tcase.documentsCount, documentsCount)
 			})
 		}
 	})
@@ -413,4 +305,26 @@ func waitForReplicaInit(client *mongo.Client) error {
 		}
 	}
 
+}
+
+func createDbConnection(ctx context.Context, c dktest.ContainerInfo) (*mongo.Client, error) {
+
+	ip, port, err := c.FirstPort()
+	if err != nil {
+		return nil, fmt.Errorf("port error: %w", err)
+	}
+
+	// there is connect option for excluding serverConnection algorithm
+	// it's let avoid errors with mongo replica set connection in docker container
+	addr := fmt.Sprintf("mongodb://%s/?connect=direct", net.JoinHostPort(ip, port))
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(addr))
+	if err != nil {
+		return nil, fmt.Errorf("connect error '%s': %w", addr, err)
+	}
+
+	if err = client.Ping(ctx, nil); err != nil {
+		return nil, fmt.Errorf("ping error: %w", err)
+	}
+
+	return client, nil
 }
